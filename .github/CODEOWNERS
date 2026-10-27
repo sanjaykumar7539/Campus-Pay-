@@ -1,0 +1,12 @@
+# CODEOWNERS for CampusPay Monorepo
+# Teams or individuals responsible for specific paths
+
+* @campuspay-core-team
+
+/backend/ @campuspay-backend-team
+/frontend-admin/ @campuspay-frontend-team
+/mobile/ @campuspay-mobile-team
+/firmware/ @campuspay-hardware-team
+/hardware/ @campuspay-hardware-team
+/infrastructure/ @campuspay-devops-team
+/docs/ @campuspay-core-team

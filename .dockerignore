@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+**/__pycache__
+**/.pytest_cache
+**/*.db
+**/*.sqlite*
+**/*.pyc
+**/.venv
+backend/tests
+outputs
+work

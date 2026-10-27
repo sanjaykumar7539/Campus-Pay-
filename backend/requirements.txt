@@ -1,0 +1,11 @@
+# Python 3.12; tested upgrade versions. Run pip-audit before deployment.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+sqlalchemy==2.0.54
+alembic==1.20.0
+pydantic==2.13.5
+PyJWT[crypto]==2.15.1
+bcrypt==4.3.0
+python-multipart==0.0.32
+psycopg2-binary==2.9.13
+webauthn==3.0.1

@@ -1,0 +1,319 @@
+"""Kiosk orchestration. Scanner results are accepted only from a provisioned native agent.
+
+The agent is a trusted hardware boundary, not browser JavaScript. Its adapter must
+identify/enroll using real hardware and return a stable opaque reference per finger.
+"""
+import hashlib
+import secrets
+from datetime import timedelta
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+from core.errors import ConflictError, ForbiddenError, UnauthorizedError, NotFoundError
+from modules.auth import service as auth
+from modules.auth.kiosk_models import KioskSession, ScannerAgent, FingerprintEnrollment, FingerprintChallenge, ScannerCapture
+from modules.devices.models import Device
+from modules.institutions import service as institutions
+from modules.users import service as users
+from modules.merchants import service as merchants
+from modules.payments import service as payments
+from modules.audit import service as audit
+from shared.clock import utcnow
+
+COOKIE = "cp_kiosk"
+SESSION_SECONDS = 7 * 24 * 3600
+
+
+def digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def active_device(db, institution_id, device_id):
+    device = db.execute(select(Device).where(Device.id == device_id, Device.institution_id == institution_id).with_for_update()).scalar_one_or_none()
+    if not device or device.status != "ACTIVE" or device.device_type != "KIOSK" or not device.merchant_id:
+        raise ForbiddenError("Ordering station is not active", code="DEVICE_INACTIVE")
+    if institutions.get_institution(db, institution_id).status != "ACTIVE":
+        raise ForbiddenError("Institution is inactive")
+    return device
+
+
+def session(db, token):
+    row = db.execute(select(KioskSession).where(KioskSession.token_hash == digest(token or ""))).scalar_one_or_none()
+    if not row or row.revoked or row.expires_at <= utcnow():
+        raise UnauthorizedError("Staff setup required for this station", code="KIOSK_SETUP_REQUIRED")
+    active_device(db, row.institution_id, row.device_id)
+    return row
+
+
+def setup(db, principal, device_id, authentication_mode="AUTO", receipt_mode="BROWSER"):
+    active_device(db, principal.institution_id, device_id)
+    if authentication_mode != "MOBILE":
+        db.execute(update(KioskSession).where(KioskSession.device_id == device_id,
+            KioskSession.institution_id == principal.institution_id,
+            KioskSession.authentication_mode != "MOBILE").values(revoked=1))
+    token = secrets.token_urlsafe(48)
+    row = KioskSession(institution_id=principal.institution_id, device_id=device_id,
+        token_hash=digest(token), expires_at=utcnow() + timedelta(seconds=SESSION_SECONDS),
+        authentication_mode=authentication_mode, receipt_mode=receipt_mode)
+    db.add(row)
+    audit.record_event(db, institution_id=principal.institution_id, actor_id=principal.user_id,
+        actor_role="ADMIN", event_type="KIOSK_ACTIVATED", entity_type="Device", entity_id=device_id)
+    db.commit()
+    return token
+
+
+def logout_session(db, token):
+    # Stale stations still require administrator authentication to unlock.
+    row = db.execute(select(KioskSession).where(KioskSession.token_hash == digest(token or ""))).scalar_one_or_none()
+    if not row:
+        raise UnauthorizedError("Staff setup required for this station", code="KIOSK_SETUP_REQUIRED")
+    return row
+
+
+def logout(db, s, username, password):
+    inst = institutions.get_institution(db, s.institution_id)
+    from core.config import get_settings
+    from app import kiosk_credentials
+    if get_settings().environment in ("local", "demo", "test") and kiosk_credentials.HASH_FILE.is_file():
+        principal = kiosk_credentials.verify_kiosk_login(db, inst.code, username, password)
+    else:
+        from core.security import decode_access_token
+        result = auth.login(db, institution_code=inst.code, username=username, password=password)
+        if result.role != "ADMIN":
+            raise ForbiddenError("An administrator must unlock this station")
+        principal = decode_access_token(result.access_token)
+    s.revoked = 1
+    db.execute(update(FingerprintChallenge).where(FingerprintChallenge.session_id == s.id,
+        FingerprintChallenge.status.in_(["FIRST_SCAN", "SECOND_SCAN", "READY"])).values(status="CANCELLED"))
+    audit.record_event(db, institution_id=s.institution_id, actor_id=principal.user_id, actor_role="ADMIN",
+        event_type="KIOSK_UNLOCKED", entity_type="Device", entity_id=s.device_id)
+    db.commit()
+
+
+def provision_agent(db, principal, device_id):
+    active_device(db, principal.institution_id, device_id)
+    row = db.execute(select(ScannerAgent).where(ScannerAgent.device_id == device_id,
+        ScannerAgent.institution_id == principal.institution_id)).scalar_one_or_none()
+    token = secrets.token_urlsafe(48)
+    if row:
+        row.token_hash, row.last_seen_at = digest(token), None
+    else:
+        db.add(ScannerAgent(institution_id=principal.institution_id, device_id=device_id, token_hash=digest(token)))
+    db.execute(update(FingerprintChallenge).where(FingerprintChallenge.device_id == device_id,
+        FingerprintChallenge.status.in_(["FIRST_SCAN", "SECOND_SCAN", "READY"])).values(status="CANCELLED"))
+    audit.record_event(db, institution_id=principal.institution_id, actor_id=principal.user_id, actor_role="ADMIN",
+        event_type="SCANNER_KEY_ROTATED", entity_type="Device", entity_id=device_id)
+    db.commit()
+    return {"agent_token": token, "device_id": device_id, "message": "Shown once. Install in the native scanner service, never in the browser."}
+
+
+def agent(db, token):
+    row = db.execute(select(ScannerAgent).where(ScannerAgent.token_hash == digest(token or ""))).scalar_one_or_none()
+    if not row:
+        raise UnauthorizedError("Scanner authentication required")
+    active_device(db, row.institution_id, row.device_id)
+    return row
+
+
+def scanner_online(db, device_id):
+    row = db.execute(select(ScannerAgent).where(ScannerAgent.device_id == device_id)).scalar_one_or_none()
+    return bool(row and row.last_seen_at and row.last_seen_at > utcnow() - timedelta(seconds=30))
+
+
+def menu(db, s):
+    device = active_device(db, s.institution_id, s.device_id)
+    result = merchants.get_menu(db, institution_id=s.institution_id, merchant_id=device.merchant_id,
+        actor_user_id=s.device_id, actor_role="ADMIN")
+    result.update({"authentication_mode": s.authentication_mode, "receipt_mode": s.receipt_mode, "device_name": device.name, "scanner_online": scanner_online(db, s.device_id)})
+    return result
+
+
+def _new_challenge(db, *, institution_id, device_id, purpose, auth_method="SCANNER", **kw):
+    active_device(db, institution_id, device_id)  # serialize all jobs for a physical scanner
+    if auth_method == "SCANNER" and not scanner_online(db, device_id):
+        raise ConflictError("Fingerprint scanner is offline. Please ask staff for help.", code="SCANNER_OFFLINE")
+    busy_query = select(FingerprintChallenge).where(FingerprintChallenge.device_id == device_id,
+        FingerprintChallenge.auth_method == auth_method, FingerprintChallenge.expires_at > utcnow(),
+        FingerprintChallenge.status.in_(["FIRST_SCAN", "SECOND_SCAN", "READY"]))
+    if auth_method == "MOBILE":
+        busy_query = busy_query.where(FingerprintChallenge.session_id == kw.get("session_id"))
+    busy = db.execute(busy_query).first()
+    if busy:
+        raise ConflictError("Scanner is busy. Finish or cancel the current session.", code="SCANNER_BUSY")
+    c = FingerprintChallenge(institution_id=institution_id, device_id=device_id, purpose=purpose, auth_method=auth_method,
+        nonce=secrets.token_hex(32), expires_at=utcnow() + timedelta(seconds=90), **kw)
+    db.add(c)
+    db.flush()
+    return c
+
+
+def checkout(db, s, items, auth_method="SCANNER"):
+    data = menu(db, s)
+    if data["merchant"]["status"] != "ACTIVE" or not data["merchant"]["accepting_orders"]:
+        raise ConflictError("This canteen is currently closed", code="MERCHANT_INACTIVE")
+    products = {p["id"]: p for cat in data["categories"] for p in cat["products"]}
+    merged = {}
+    for item in items:
+        merged[item.product_id] = merged.get(item.product_id, 0) + item.quantity
+    lines = []
+    for pid, qty in sorted(merged.items()):
+        p = products.get(pid)
+        if not p or p["availability"] != "AVAILABLE" or qty > p["stock_quantity"] or qty > 100:
+            raise ConflictError("An item is unavailable or its stock changed. Refresh the menu.", code="STOCK_CHANGED")
+        lines.append({"product_id": pid, "quantity": qty, "name": p["name"], "price_cu": p["price_cu"]})
+    c = _new_challenge(db, institution_id=s.institution_id, device_id=s.device_id, purpose="PAY",
+        session_id=s.id, auth_method=auth_method, cart={"merchant_id": data["merchant"]["id"], "items": lines,
+        "total_cu": sum(i["quantity"] * i["price_cu"] for i in lines)})
+    db.commit()
+    return view(c)
+
+
+def enrollment(db, principal, student_id, device_id, consent):
+    if not consent:
+        raise ForbiddenError("Confirm the student's informed consent before enrollment")
+    users.require_active_customer(db, institution_id=principal.institution_id, user_id=student_id)
+    c = _new_challenge(db, institution_id=principal.institution_id, device_id=device_id,
+        purpose="ENROLL", student_id=student_id)
+    audit.record_event(db, institution_id=principal.institution_id, actor_id=principal.user_id,
+        actor_role="ADMIN", event_type="FINGERPRINT_ENROLLMENT_REQUESTED", entity_type="CampusUser",
+        entity_id=student_id, metadata={"consent_confirmed": True})
+    db.commit()
+    return view(c)
+
+
+def view(c):
+    return {"id": c.id, "status": c.status if c.expires_at > utcnow() or c.status in ("CONSUMED", "ENROLLED") else "EXPIRED",
+        "auth_method": c.auth_method, "purpose": c.purpose, "expires_at": c.expires_at.isoformat() + "Z", "order_id": c.order_id,
+        "total_cu": c.cart.get("total_cu"), "items": c.cart.get("items", [])}
+
+
+def get_challenge(db, cid, institution_id):
+    c = db.execute(select(FingerprintChallenge).where(FingerprintChallenge.id == cid,
+        FingerprintChallenge.institution_id == institution_id).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+    if not c:
+        raise NotFoundError("Session not found")
+    return c
+
+
+def kiosk_challenge(db, s, cid):
+    c = get_challenge(db, cid, s.institution_id)
+    if c.session_id != s.id or c.device_id != s.device_id:
+        raise ForbiddenError("Session belongs to another station")
+    return c
+
+
+def cancel(db, c):
+    if c.status not in ("CONSUMED", "ENROLLED"):
+        c.status = "CANCELLED"
+        db.commit()
+    return view(c)
+
+
+def jobs(db, a):
+    a.last_seen_at = utcnow()
+    rows = db.execute(select(FingerprintChallenge).where(FingerprintChallenge.device_id == a.device_id,
+        FingerprintChallenge.institution_id == a.institution_id, FingerprintChallenge.expires_at > utcnow(),
+        FingerprintChallenge.auth_method == "SCANNER",
+        FingerprintChallenge.status.in_(["FIRST_SCAN", "SECOND_SCAN"])).order_by(FingerprintChallenge.created_at)).scalars().all()
+    result = [{"id": c.id, "nonce": c.nonce, "purpose": c.purpose,
+        "stage": 1 if c.status == "FIRST_SCAN" else 2, "expires_at": c.expires_at.isoformat() + "Z"} for c in rows]
+    db.commit()
+    return result
+
+
+def capture(db, a, cid, body):
+    c = get_challenge(db, cid, a.institution_id)
+    if c.auth_method != "SCANNER" or c.device_id != a.device_id or c.expires_at <= utcnow() or c.status not in ("FIRST_SCAN", "SECOND_SCAN"):
+        raise ForbiddenError("Capture is expired, cancelled or belongs to another device")
+    if not secrets.compare_digest(c.nonce, body.nonce):
+        raise ForbiddenError("Stale scan challenge", code="SCAN_REPLAY")
+    if c.session_id:
+        s = db.get(KioskSession, c.session_id)
+        if not s or s.revoked or s.expires_at <= utcnow():
+            raise ForbiddenError("Kiosk session ended")
+    try:
+        with db.begin_nested():
+            db.add(ScannerCapture(institution_id=a.institution_id, device_id=a.device_id,
+                challenge_id=c.id, capture_id=body.capture_id))
+            db.flush()
+    except IntegrityError as exc:
+        raise ConflictError("A fresh finger capture is required", code="SCAN_REPLAY") from exc
+    if not body.matched or not body.finger_ref or (c.status == "SECOND_SCAN" and c.finger_ref != body.finger_ref):
+        c.status = "FAILED"
+    elif c.status == "FIRST_SCAN":
+        if c.purpose == "PAY":
+            enrolled = db.execute(select(FingerprintEnrollment).where(FingerprintEnrollment.institution_id == a.institution_id,
+                FingerprintEnrollment.finger_ref == body.finger_ref, FingerprintEnrollment.status == "ACTIVE")).scalar_one_or_none()
+            if not enrolled:
+                c.status = "FAILED"
+            else:
+                customer = users.require_active_customer(db, institution_id=a.institution_id, user_id=enrolled.campus_user_id)
+                order, _ = merchants.create_order(db, institution_id=a.institution_id, merchant_id=c.cart["merchant_id"],
+                    customer_id=customer.id, items=[(i["product_id"], i["quantity"]) for i in c.cart["items"]],
+                    actor_user_id=customer.id, actor_role="STUDENT", device_id=a.device_id, client_request_key="kiosk-" + c.id)
+                if order.total_cu != c.cart["total_cu"] or any(
+                    next(i["price_cu"] for i in c.cart["items"] if i["product_id"] == line.product_id) != line.unit_price_cu for line in order.items):
+                    raise ConflictError("Menu price changed. Start a new checkout.", code="PRICE_CHANGED")
+                c.student_id, c.order_id = customer.id, order.id
+        if c.status != "FAILED":
+            c.finger_ref = body.finger_ref
+            if c.purpose == "PAY":
+                c.status = "READY"
+            else:
+                c.status = "SECOND_SCAN"
+                c.nonce = secrets.token_hex(32)
+    else:
+        if c.purpose == "ENROLL":
+            # A reference cannot be rebound to another student, including after revocation.
+            row = db.execute(select(FingerprintEnrollment).where(FingerprintEnrollment.institution_id == a.institution_id,
+                FingerprintEnrollment.campus_user_id == c.student_id).with_for_update()).scalar_one_or_none()
+            if row:
+                raise ConflictError("Re-enrollment requires a supervised enrollment reset; contact the operator", code="ENROLLMENT_EXISTS")
+            try:
+                with db.begin_nested():
+                    db.add(FingerprintEnrollment(institution_id=a.institution_id, campus_user_id=c.student_id, finger_ref=c.finger_ref))
+                    db.flush()
+            except IntegrityError as exc:
+                raise ConflictError("This finger is already enrolled", code="FINGER_ALREADY_ENROLLED") from exc
+            c.status = "ENROLLED"
+        else:
+            c.status = "READY"
+    audit.record_event(db, institution_id=a.institution_id, actor_id=a.device_id, actor_role="SCANNER",
+        event_type="FINGERPRINT_" + c.status, entity_type="FingerprintChallenge", entity_id=c.id,
+        result="FAILURE" if c.status == "FAILED" else "SUCCESS")
+    a.last_seen_at = utcnow()
+    db.commit()
+    return view(c)
+
+
+def pay(db, s, cid):
+    c = kiosk_challenge(db, s, cid)
+    if c.status not in ("READY", "CONSUMED") or not c.order_id:
+        raise ForbiddenError("Verified fingerprint authorization required", code="FINGERPRINT_REQUIRED")
+    return payments.pay_fingerprint_order(db, institution_id=s.institution_id, order_id=c.order_id,
+        student_id=c.student_id, device_id=s.device_id, authorization_id=c.id)
+
+
+def enrollment_status(db, institution_id, student_id):
+    row = db.execute(select(FingerprintEnrollment).where(FingerprintEnrollment.institution_id == institution_id,
+        FingerprintEnrollment.campus_user_id == student_id)).scalar_one_or_none()
+    from modules.auth.kiosk_models import MobileCredential
+    mobile = db.execute(select(MobileCredential.id).where(MobileCredential.institution_id == institution_id,
+        MobileCredential.campus_user_id == student_id, MobileCredential.status == "ACTIVE")).first()
+    return "ACTIVE" if mobile else (row.status if row else "NOT_ENROLLED")
+
+
+def revoke_enrollment(db, principal, student_id):
+    row = db.execute(select(FingerprintEnrollment).where(FingerprintEnrollment.institution_id == principal.institution_id,
+        FingerprintEnrollment.campus_user_id == student_id).with_for_update()).scalar_one_or_none()
+    from modules.auth.kiosk_models import MobileCredential
+    mobile = db.execute(select(MobileCredential).where(MobileCredential.institution_id == principal.institution_id,
+        MobileCredential.campus_user_id == student_id)).scalars().all()
+    if not row and not mobile:
+        raise NotFoundError("Fingerprint enrollment not found")
+    if row:
+        row.status = "REVOKED"
+    for credential in mobile:
+        credential.status = "REVOKED"
+    audit.record_event(db, institution_id=principal.institution_id, actor_id=principal.user_id, actor_role="ADMIN",
+        event_type="FINGERPRINT_REVOKED", entity_type="CampusUser", entity_id=student_id)
+    db.commit()

@@ -1,0 +1,7 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Custom paths
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.ico filter=lfs diff=lfs merge=lfs -text

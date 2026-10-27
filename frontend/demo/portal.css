@@ -1,0 +1,14 @@
+form{display:grid;gap:12px}form label{display:grid;gap:6px;font-size:13px}form input,form select{width:100%}.check{display:flex;align-items:start}.check input{width:auto}.inline-form{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));align-items:end;margin-bottom:25px}textarea{width:100%;min-height:90px}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word}.table-wrap button{padding:6px 10px;margin:3px}#studentSearch{max-width:380px;margin-bottom:15px}.card p{line-height:1.6}.app-section{scroll-margin-top:20px}@media print{body *{visibility:hidden}#recoveredReceipt,#recoveredReceipt *{visibility:visible}#recoveredReceipt{position:absolute;left:0;top:0;width:80mm}#recoveredReceipt button{display:none}}
+
+/* Admin wallet action cards */
+#walletActionsGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:stretch;margin:18px 0 24px}
+#walletActionsGrid>.card{min-width:0;box-sizing:border-box;margin:0}
+#walletActionsGrid form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px;align-items:start}
+#walletActionsGrid form>label{display:flex;flex-direction:column;gap:7px;min-width:0;margin:0}
+#walletActionsGrid form input:not([type="checkbox"]){min-width:0;width:100%;box-sizing:border-box;min-height:44px}
+#walletActionsGrid small{font-size:12px;line-height:1.4;min-height:18px}
+#walletActionsGrid form>label.check{grid-column:1/-1;display:flex;flex-direction:row;align-items:center;gap:8px}
+#walletActionsGrid input[type="checkbox"]{width:auto;flex-shrink:0}
+#walletActionsGrid form>button{grid-column:1/-1;width:100%;min-height:44px}
+@media(max-width:1050px){#walletActionsGrid{grid-template-columns:1fr}}
+@media(max-width:520px){#walletActionsGrid form{grid-template-columns:1fr}#walletActionsGrid form>label{grid-column:1/-1}}
